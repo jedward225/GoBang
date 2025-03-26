@@ -1,137 +1,306 @@
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from collections import deque
+import random
+import pygame
+import copy
 
-class GomokuEnv:
-    def __init__(self, board_size):
+class GoBangEnv:
+    """五子棋环境"""
+    def __init__(self, board_size=15):
         self.board_size = board_size
         self.reset()
-
+        
     def reset(self):
+        """重置棋盘"""
         self.board = np.zeros((self.board_size, self.board_size), dtype=np.int8)
-        self.current_player = 1  # 1: 黑棋，-1: 白棋
-        return self.board, self.current_player
-
+        self.current_player = 1  # 1为黑棋，-1为白棋
+        self.done = False
+        return self._get_state()
+    
+    def _get_state(self):
+        """获取当前状态，转换为神经网络输入格式"""
+        # 3个通道：己方棋子、对方棋子、当前手
+        state = np.zeros((3, self.board_size, self.board_size), dtype=np.float32)
+        state[0] = (self.board == self.current_player)
+        state[1] = (self.board == -self.current_player)
+        state[2] = np.ones((self.board_size, self.board_size)) * (self.current_player == 1)
+        return state
+    
     def step(self, action):
-        if not self.is_valid_action(action):
-            print(f"Invalid action {action} received. Skipping this step.")
-            return self.board, 0, False, {}  # 返回当前棋盘状态、奖励为0、游戏未结束和空字典
-
-        assert self.is_valid_action(action)
+        """执行一步动作
+        action: (x, y) 坐标元组
+        returns: (next_state, reward, done)
+        """
         x, y = action
-        self.board[x, y] = self.current_player
-
-        # 检查棋盘是否已满，如果是，则宣布平局并返回
-        if np.all(self.board != 0):
-            print("Board is full. Declaring a draw.")
-            reward = 0  # 平局奖励为0
-            done = True
-        else:
-            winner = self.check_win()  # 检查是否有玩家获胜或平局
-            reward = self.get_reward(winner)
-            done = winner is not None  # 如果游戏结束，则设置done为True
-
-        self.current_player *= -1  # 切换当前玩家
-        return self.board, reward, done, {}
-
-    def is_valid_action(self, action):
-        x, y = action
-        return self.board[x, y] == 0  # 位置为空
-
-    def check_win(self):
-        # 实现棋盘状态检查，判断是否有玩家获胜或平局
-        pass
-
-    def get_reward(self, winner):
-        if winner == 1:
-            return 1  # 黑棋获胜
-        elif winner == -1:
-            return -1  # 白棋获胜
-        else:
-            return 0  # 平局或游戏未结束
-
-# 定义Q-learning训练器类
-class QLearningTrainer:
-    def __init__(self, env, learning_rate, discount_factor, epsilon, exploration_decay, replay_memory_size):
-        self.env = env
-        self.learning_rate = learning_rate
-        self.discount_factor = discount_factor
-        self.epsilon = epsilon
-        self.exploration_decay = exploration_decay
-        self.replay_memory = deque(maxlen=replay_memory_size)
-
-    def train(self, num_episodes, max_steps_per_episode):
-        q_table = np.zeros((self.env.board_size, self.env.board_size, self.env.board_size, self.env.board_size))
-
-        for episode in range(num_episodes):
-            state, player = self.env.reset()
-            for _ in range(max_steps_per_episode):
-                action = self.select_action(state, player, q_table)
-                if not self.env.is_valid_action(action):  # 新增：检查选择的action是否有效
-                    print(f"Invalid action {action} returned by select_action. Skipping this step.")
-                    continue  # 跳过本次循环，避免将无效经验添加到重放缓冲区
-
-                next_state, reward, done, _ = self.env.step(action)
-
-                # 将经验存储到重放缓冲区
-                self.replay_memory.append((state, player, action, reward, next_state, done))
-                if len(self.replay_memory) > self.replay_memory.maxlen // 2:
-                    # 从重放缓冲区中采样经验进行学习
-                    batch = np.random.choice(self.replay_memory, size=32, replace=False)
-                    states, players, actions, rewards, next_states, dones = zip(*batch)
-
-                    # 更新Q表
-                    for s, p, a, r, ns, d in zip(states, players, actions, rewards, next_states, dones):
-                        q_target = r
-                        if not d:
-                            best_next_action = self.get_best_action(ns, p, q_table)
-                            q_target = r + self.discount_factor * q_table[tuple(best_next_action)]
-
-                        q_table[s[0], s[1], s[2], s[3]][a] += self.learning_rate * (q_target - q_table[s[0], s[1], s[2], s[3]][a])
-
-                if done:
+        
+        # 检查动作是否合法
+        if self.board[x][y] != 0:
+            return self._get_state(), -1, True
+        
+        # 落子
+        self.board[x][y] = self.current_player
+        
+        # 检查是否获胜
+        if self._check_win(x, y):
+            return self._get_state(), 1, True
+            
+        # 检查是否平局
+        if np.count_nonzero(self.board) == self.board_size * self.board_size:
+            return self._get_state(), 0, True
+            
+        # 切换玩家
+        self.current_player *= -1
+        return self._get_state(), 0, False
+        
+    def _check_win(self, x, y):
+        """检查是否获胜"""
+        player = self.board[x][y]
+        directions = [(1,0), (0,1), (1,1), (1,-1)]
+        
+        for dx, dy in directions:
+            count = 1
+            # 正向检查
+            for i in range(1, 5):
+                new_x, new_y = x + dx*i, y + dy*i
+                if not (0 <= new_x < self.board_size and 0 <= new_y < self.board_size):
                     break
+                if self.board[new_x][new_y] != player:
+                    break
+                count += 1
+            # 反向检查
+            for i in range(1, 5):
+                new_x, new_y = x - dx*i, y - dy*i
+                if not (0 <= new_x < self.board_size and 0 <= new_y < self.board_size):
+                    break
+                if self.board[new_x][new_y] != player:
+                    break
+                count += 1
+            if count >= 5:
+                return True
+        return False
 
-                state = next_state
-                player = -player  # 切换玩家
+class GoBangNet(nn.Module):
+    """五子棋策略价值网络"""
+    def __init__(self, board_size=15):
+        super(GoBangNet, self).__init__()
+        # 共享特征提取层
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        
+        # 策略头
+        self.policy_conv = nn.Conv2d(128, 4, kernel_size=1)
+        self.policy_fc = nn.Linear(4 * board_size * board_size, board_size * board_size)
+        
+        # 价值头
+        self.value_conv = nn.Conv2d(128, 2, kernel_size=1)
+        self.value_fc1 = nn.Linear(2 * board_size * board_size, 64)
+        self.value_fc2 = nn.Linear(64, 1)
+        
+    def forward(self, x):
+        # 特征提取
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        
+        # 策略头
+        policy = F.relu(self.policy_conv(x))
+        policy = policy.view(policy.size(0), -1)
+        policy = self.policy_fc(policy)
+        policy = F.log_softmax(policy, dim=1)
+        
+        # 价值头
+        value = F.relu(self.value_conv(x))
+        value = value.view(value.size(0), -1)
+        value = F.relu(self.value_fc1(value))
+        value = torch.tanh(self.value_fc2(value))
+        
+        return policy, value
 
-            # 衰减探索率
-            self.epsilon *= self.exploration_decay
+class ReplayBuffer:
+    """经验回放缓冲区"""
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+    
+    def __len__(self):
+        return len(self.buffer)
 
-        return q_table
+class GoBangAI:
+    """五子棋AI代理"""
+    def __init__(self, board_size=15):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.board_size = board_size
+        self.policy_value_net = GoBangNet(board_size).to(self.device)
+        self.optimizer = optim.Adam(self.policy_value_net.parameters(), lr=0.001)
+        self.replay_buffer = ReplayBuffer(10000)
+        
+    def select_action(self, state, epsilon=0.1):
+        """选择动作，使用epsilon-贪婪策略"""
+        if random.random() < epsilon:
+            # 随机探索
+            valid_moves = np.where(state[0] == 0)
+            move_idx = random.randint(0, len(valid_moves[0])-1)
+            return (valid_moves[0][move_idx], valid_moves[1][move_idx])
+        
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            policy, value = self.policy_value_net(state_tensor)
+            policy = policy.exp().view(self.board_size, self.board_size)
+            
+            # 将已经有棋子的位置的概率设为0
+            valid_moves = (state[0] == 0)
+            policy = policy * torch.FloatTensor(valid_moves).to(self.device)
+            
+            # 选择最高概率的动作
+            move = policy.argmax().item()
+            return (move // self.board_size, move % self.board_size)
+    
+    def _action_to_index(self, action):
+        """将动作坐标转换为一维索引"""
+        x, y = action
+        return x * self.board_size + y
+    
+    def train(self, batch_size=32, gamma=0.99):
+        """训练网络"""
+        if len(self.replay_buffer) < batch_size:
+            return
+            
+        # 采样mini-batch
+        transitions = self.replay_buffer.sample(batch_size)
+        batch = list(zip(*transitions))
+        
+        # 准备数据
+        state_batch = torch.FloatTensor(np.array(batch[0])).to(self.device)
+        # 将动作转换为一维索引
+        action_indices = [self._action_to_index(action) for action in batch[1]]
+        action_batch = torch.LongTensor(action_indices).to(self.device)
+        reward_batch = torch.FloatTensor(batch[2]).to(self.device)
+        next_state_batch = torch.FloatTensor(np.array(batch[3])).to(self.device)
+        done_batch = torch.FloatTensor(batch[4]).to(self.device)
+        
+        # 计算当前Q值
+        policy, value = self.policy_value_net(state_batch)
+        
+        # 计算目标Q值
+        next_policy, next_value = self.policy_value_net(next_state_batch)
+        target_value = reward_batch + gamma * next_value.squeeze() * (1 - done_batch)
+        
+        # 计算损失
+        value_loss = F.mse_loss(value.squeeze(), target_value)
+        policy_loss = F.nll_loss(policy, action_batch)
+        total_loss = value_loss + policy_loss
+        
+        # 优化
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+        
+        return total_loss.item()
 
-    def select_action(self, state, player, q_table):
-        valid_actions = []
-        for i in range(self.env.board_size):
-            for j in range(self.env.board_size):
-                if self.env.is_valid_action((i, j)):  # 检查该位置是否为空
-                    valid_actions.append((i, j))
+def evaluate_ai(ai, num_games=10):
+    """评估AI的性能"""
+    env = GoBangEnv()
+    wins = 0
+    draws = 0
+    
+    for game in range(num_games):
+        state = env.reset()
+        done = False
+        
+        while not done:
+            action = ai.select_action(state, epsilon=0.0)  # 评估时不使用探索
+            state, reward, done = env.step(action)
+            
+            if done:
+                if reward == 1:
+                    wins += 1
+                elif reward == 0:
+                    draws += 1
+                break
+    
+    return wins, draws, num_games - wins - draws
 
-        if not valid_actions:
-            print("Warning: No valid actions found! Returning a default action.")
-            return (0, 0)  # 返回一个默认动作，这里以(0, 0)为例
+def self_play_training(ai, num_games=100):
+    """自我对弈训练"""
+    env = GoBangEnv()
+    
+    for game in range(num_games):
+        state = env.reset()
+        game_memory = []
+        done = False
+        
+        while not done:
+            # 选择动作
+            action = ai.select_action(state, epsilon=0.1)
+            next_state, reward, done = env.step(action)
+            
+            # 存储经验
+            game_memory.append((state, action, reward))
+            
+            if done:
+                # 根据游戏结果调整奖励
+                final_reward = reward
+                # 反向传播奖励
+                for prev_state, prev_action, _ in reversed(game_memory):
+                    ai.replay_buffer.push(prev_state, prev_action, final_reward, next_state, done)
+                    final_reward *= 0.95  # 衰减奖励
+            
+            state = next_state
+            
+            # 训练
+            if len(ai.replay_buffer) >= 32:
+                loss = ai.train()
+                
+        if game % 10 == 0:
+            wins, draws, losses = evaluate_ai(ai, num_games=5)
+            print(f"自我对弈游戏 {game}, 评估结果 - 胜: {wins}, 平: {draws}, 负: {losses}")
 
-        if np.random.rand() < self.epsilon:
-            # 随机选择一个有效的动作
-            action = valid_actions[np.random.randint(len(valid_actions))]
-        else:
-            # 基于Q表选择最佳动作，仅在有效动作中选择
-            max_q_values = [q_table[state[0], state[1], i, j] for i, j in valid_actions]
-            best_action_idx = np.argmax(max_q_values)
-            action = valid_actions[best_action_idx]
+def train_ai():
+    """训练AI"""
+    try:
+        print("初始化环境和AI...")
+        ai = GoBangAI()
+        
+        print("开始自我对弈训练...")
+        for iteration in range(10):  # 10轮训练
+            print(f"训练轮次 {iteration + 1}/10")
+            self_play_training(ai, num_games=100)  # 每轮100局自我对弈
+            
+            # 保存模型检查点
+            print(f"保存模型检查点 {iteration}...")
+            torch.save(ai.policy_value_net.state_dict(), f"gobang_model_iter{iteration}.pth")
+            
+            # 评估
+            wins, draws, losses = evaluate_ai(ai, num_games=20)
+            print(f"轮次 {iteration + 1} 评估结果 - 胜: {wins}, 平: {draws}, 负: {losses}")
+        
+        return ai
+        
+    except Exception as e:
+        print(f"训练过程出错: {e}")
+        raise
 
-        return action
-    def get_best_action(self, state, player, q_table):
-        return np.unravel_index(np.argmax(q_table[state[0], state[1], :, :]), (self.env.board_size, self.env.board_size))
-
-# 训练五子棋AI
-board_size = 15
-num_episodes = 10000
-max_steps_per_episode = board_size ** 2 + 1  # 适当设置最大步数
-
-env = GomokuEnv(board_size)
-trainer = QLearningTrainer(env, learning_rate=0.1, discount_factor=0.9, epsilon=1.0, exploration_decay=0.999,
-                           replay_memory_size=10000)
-q_table = trainer.train(num_episodes, max_steps_per_episode)
-
-# 保存训练好的Q表以供后续使用
-np.save("gomoku_q_table.npy", q_table)
+if __name__ == "__main__":
+    try:
+        print("开始五子棋AI训练程序...")
+        ai = train_ai()
+        print("训练完成，保存最终模型...")
+        torch.save(ai.policy_value_net.state_dict(), "gobang_model_final.pth")
+        
+        # 最终评估
+        wins, draws, losses = evaluate_ai(ai, num_games=50)
+        print(f"最终评估结果 - 胜: {wins}, 平: {draws}, 负: {losses}")
+        print("程序结束")
+    except Exception as e:
+        print(f"程序执行出错: {e}")
+        raise
